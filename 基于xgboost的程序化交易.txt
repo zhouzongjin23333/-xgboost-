@@ -1,0 +1,208 @@
+# 可以自己import我们平台支持的第三方python模块，比如pandas、numpy等。
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression 
+from xgboost.sklearn import XGBRegressor
+import datetime
+import time
+# 在这个方法中编写任何的初始化逻辑。context对象将会在你的算法策略的任何方法之间做传递。
+def init(context):
+    # 选中股票池为沪深300
+    context.stocks = index_components('000300.XSHG')
+
+    #每月调参
+    scheduler.run_monthly(LGB_select,tradingday=1)
+
+    #自己股票池持有个数
+    context.stocknum = 20
+
+def lgb_select(context):
+
+    # 转化日期模块
+    end_time = time.strftime('%Y-%m-%d',time.localtime(time.time()))
+    start_year = int(time.strftime('%Y',time.localtime(time.time()))) - 1
+    month_day = time.strftime('%m-%d',time.localtime(time.time()))
+    start_time = '{}-{}'.format(start_year,month_day)
+
+    #选取训练日期
+    date = get_trading_dates(start_date='2019-01-01',end_date='2019-06-01')
+
+    #转化每月最后交易日模块
+    month_date = []
+    for i in range(len(date)-1):
+        if date[i].year != date[i+1].year:
+            month_date.append(date[i])
+        elif date[i].month != date[i+1].month:
+            month_date.append(date[i])
+    # 把最后一个交易日加上
+    month_date.append(date[-1])
+
+
+
+
+    all_data = pd.DataFrame()
+    for i in range(len(date) - 1):
+        # 选取因子
+        q = query(
+        fundamentals.eod_derivative_indicator.market_cap,
+        fundamentals.eod_derivative_indicator.pe_ratio,
+        fundamentals.eod_derivative_indicator.pb_ratio,    
+        fundamentals.income_statement.profit_before_tax,
+        fundamentals.income_statement.revenue,
+        fundamentals.income_statement.total_expense,
+        fundamentals.financial_indicator.du_return_on_equity,
+        fundamentals.financial_indicator.earnings_per_share,
+        ).filter(fundamentals.stockcode.in_(context.stocks))
+    
+        fund = get_fundamentals(q, entry_date=date[i]).T.astype('float')
+        fund['date'] =date[i]
+
+        #提取价格数据
+        price = get_price(context.stocks ,start_date = date[i],end_date = date[i+1])['close'].T
+        
+        #生成收益率数据
+        fund['price_rise'] = (price.iloc[:,1] - price.iloc[:,0]) / price.iloc[:,0]
+        
+        all_data = pd.concat((all_data,fund))
+
+    #删除缺失值
+    all_data = all_data.dropna()
+    
+    #选出训练集和标签
+    y = all_data['price_rise']
+    x = all_data.drop(['price_rise','date'],axis=1)
+
+    #标准化，离群值处理和市值中性化
+    for i in x.columns:
+        x[i] = mad(x[i],3)
+        x[i] = stand(x[i])
+        
+    for i in x.drop('market_cap',axis=1,inplace=False).columns:
+        x[i] = out_market(factor=x[i],market=x['market_cap'])
+
+    #开始训练
+    gbm = XGBRegressor(learning_rate =0.1,
+                        n_estimators=49,
+                        max_depth=5,
+                        min_child_weight=1,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        nthread=4,
+                        auc='roc',
+                        seed=0,
+                        early_stopping_rounds=5,
+                        )
+    gbm.fit(x,y,eval_metric='auc')
+    return gbm
+            
+
+
+
+def LGB_select(context,bar_dict):
+    
+    q = query(
+    fundamentals.eod_derivative_indicator.market_cap,
+    fundamentals.eod_derivative_indicator.pe_ratio,
+    fundamentals.eod_derivative_indicator.pb_ratio,    
+    fundamentals.income_statement.profit_before_tax,
+    fundamentals.income_statement.revenue,
+    fundamentals.income_statement.total_expense,
+    fundamentals.financial_indicator.du_return_on_equity,
+    fundamentals.financial_indicator.earnings_per_share,
+    ).filter(fundamentals.stockcode.in_(context.stocks))
+
+    fund = get_fundamentals(q)
+
+    context.factor_data = fund.T
+    
+    dealwith_data(context)
+
+    rebalance(context)
+
+
+
+def mad(factor,n):   
+    #实现n倍中位数绝对偏差去极值，一般n为3
+
+    #得出因子中位数
+    me = np.median(factor)
+
+    #得出每个因子值与中位数的绝对值并再取中位数
+    mad = np.median(abs(factor - me))
+
+    #计算n倍中位数上下限制
+    up = me + n * 1.4826 * mad
+    down = me - n * 1.4826 * mad
+
+    #去极值
+    factor = np.where(factor > up,up,factor)
+    factor = np.where(factor < down,down,factor)
+    return factor
+
+def stand(factor):
+    #实现标准化
+    return (factor - factor.mean()) / factor.std()
+
+def out_market(factor,market):
+    # 市值中性化
+    
+    market = market.values.reshape(-1,1)
+
+    lr = LinearRegression()
+    lr.fit(market,factor)
+    y_predict = lr.predict(market)
+    return factor - y_predict
+
+
+def dealwith_data(context):
+    # 对数据进行数据处理
+
+    #去空值，去极值
+    context.factor_data = context.factor_data.dropna()
+
+    #标准化
+    for i in context.factor_data.columns:
+        context.factor_data[i] = mad(context.factor_data[i],3)
+        context.factor_data[i] = stand(context.factor_data[i])
+    
+    #中性化
+    for i in context.factor_data.drop('market_cap',axis=1,inplace=False).columns:
+        context.factor_data[i] = out_market(factor=context.factor_data[i],
+                                            market=context.factor_data['market_cap'])
+
+  
+def select_stocklist(context):
+    # 
+
+    price_rise_predict = lgb_select(context).predict(context.factor_data.astype('float'))
+  
+    context.factor_data['stock_return'] = price_rise_predict
+    context.stock_list = context.factor_data.sort_values(by='stock_return',ascending=False).index[:context.stocknum]
+
+    logger.info(context.stock_list)
+
+
+def rebalance(context):
+    # 调参函数
+    # 卖出
+    select_stocklist(context)
+
+    for stock in context.portfolio.positions.keys():
+            if stock not in context.stock_list:
+                order_target_percent(stock,0)
+    # 买入
+    for stock in context.stock_list:
+        order_target_percent(stock,1.0 / len(context.stock_list))
+# before_trading此函数会在每天交易开始前被调用，当天只会被调用一次
+def before_trading(context):
+    pass
+
+
+# 你选择的证券的数据更新将会触发此段逻辑，例如日或分钟历史数据切片或者是实时数据切片更新
+def handle_bar(context, bar_dict):
+    pass
+
+
+# after_trading函数会在每天交易结束后被调用，当天只会被调用一次
+def after_trading(context):
+    pass
